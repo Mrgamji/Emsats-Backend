@@ -1,11 +1,12 @@
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
-import { supabase } from '../config/supabase.js';
+import { db } from '../config/database.js';
 import { validationResult } from 'express-validator';
 
 const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key';
 const OTP_EXPIRY_MINUTES = 10;
 
+// --- Utility Functions ---
 const generateToken = (user) => {
   return jwt.sign(
     { id: user.id, email: user.email },
@@ -14,64 +15,44 @@ const generateToken = (user) => {
   );
 };
 
-const generateOTP = () => {
-  return Math.floor(100000 + Math.random() * 900000).toString();
-};
+const generateOTP = () => Math.floor(100000 + Math.random() * 900000).toString();
 
+// --- SIGNUP ---
 export const signup = async (req, res) => {
   try {
     const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      return res.status(422).json({ error: errors.array() });
-    }
+    if (!errors.isEmpty()) return res.status(422).json({ error: errors.array() });
 
     const { fullname, email, password, phone } = req.body;
 
-    const { data: existingUser } = await supabase
-      .from('users')
-      .select('*')
-      .eq('email', email)
-      .maybeSingle();
+    db.get(`SELECT * FROM users WHERE email = ?`, [email], async (err, existingUser) => {
+      if (err) return res.status(500).json({ error: 'Database error' });
+      if (existingUser) return res.status(422).json({ error: 'Email already exists' });
 
-    if (existingUser) {
-      return res.status(422).json({ error: 'Email already exists' });
-    }
+      const hashedPassword = await bcrypt.hash(password, 10);
 
-    const hashedPassword = await bcrypt.hash(password, 10);
+      db.run(
+        `INSERT INTO users (name, email, phone, password) VALUES (?, ?, ?, ?)`,
+        [fullname, email, phone, hashedPassword],
+        function (err) {
+          if (err) return res.status(500).json({ error: 'Failed to create user' });
 
-    const { data: user, error } = await supabase
-      .from('users')
-      .insert([{
-        name: fullname,
-        email,
-        phone,
-        password: hashedPassword
-      }])
-      .select()
-      .single();
+          const otp = generateOTP();
+          const expiry = new Date(Date.now() + OTP_EXPIRY_MINUTES * 60000).toISOString();
 
-    if (error) {
-      console.error('Signup error:', error);
-      return res.status(500).json({ error: 'Failed to create user' });
-    }
+          db.run(
+            `INSERT INTO otp_cache (email, otp, expires_at) VALUES (?, ?, ?)`,
+            [email, otp, expiry],
+            (err) => {
+              if (err) console.error('Failed to insert OTP:', err);
+            }
+          );
 
-    const otp = generateOTP();
-    const otpExpiry = new Date(Date.now() + OTP_EXPIRY_MINUTES * 60000);
-
-    await supabase
-      .from('otp_cache')
-      .insert([{
-        email: user.email,
-        otp,
-        expires_at: otpExpiry.toISOString()
-      }]);
-
-    const token = generateToken(user);
-
-    res.status(201).json({
-      user,
-      token,
-      message: 'User registered successfully.'
+          const user = { id: this.lastID, fullname, email, phone };
+          const token = generateToken(user);
+          res.status(201).json({ user, token, message: 'User registered successfully.' });
+        }
+      );
     });
   } catch (error) {
     console.error('Signup exception:', error);
@@ -79,95 +60,52 @@ export const signup = async (req, res) => {
   }
 };
 
+// --- LOGIN ---
 export const login = async (req, res) => {
   try {
     const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      return res.status(422).json({ error: errors.array() });
-    }
+    if (!errors.isEmpty()) return res.status(422).json({ error: errors.array() });
 
     const { email, password } = req.body;
 
-    const { data: user, error } = await supabase
-      .from('users')
-      .select('*')
-      .eq('email', email)
-      .maybeSingle();
+    db.get(`SELECT * FROM users WHERE email = ?`, [email], async (err, user) => {
+      if (err) return res.status(500).json({ error: 'Database error' });
+      if (!user) return res.status(401).json({ error: 'Invalid credentials' });
 
-    if (!user || error) {
-      return res.status(401).json({ error: 'Invalid credentials' });
-    }
+      const isValid = await bcrypt.compare(password, user.password);
+      if (!isValid) return res.status(401).json({ error: 'Invalid credentials' });
 
-    const isPasswordValid = await bcrypt.compare(password, user.password);
-
-    if (!isPasswordValid) {
-      return res.status(401).json({ error: 'Invalid credentials' });
-    }
-
-    const token = generateToken(user);
-
-    res.json({
-      user,
-      token
+      const token = generateToken(user);
+      res.json({ user, token });
     });
   } catch (error) {
     console.error('Login exception:', error);
-    res.status(500).json({ error: 'An unexpected error occurred' });
+    res.status(500).json({ error: 'Unexpected error' });
   }
 };
 
+// --- VERIFY OTP ---
 export const verifyOtp = async (req, res) => {
   try {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      return res.status(422).json({ error: errors.array() });
-    }
-
     const { email, otp } = req.body;
 
-    const { data: otpRecord, error } = await supabase
-      .from('otp_cache')
-      .select('*')
-      .eq('email', email.toLowerCase())
-      .maybeSingle();
+    db.get(`SELECT * FROM otp_cache WHERE email = ?`, [email], (err, otpRecord) => {
+      if (err || !otpRecord) return res.status(400).json({ error: 'Invalid or expired OTP' });
 
-    if (!otpRecord || error) {
-      return res.status(400).json({ error: 'Invalid or expired OTP' });
-    }
+      if (new Date() > new Date(otpRecord.expires_at) || otpRecord.otp !== otp) {
+        db.run(`DELETE FROM otp_cache WHERE email = ?`, [email]);
+        return res.status(400).json({ error: 'Invalid or expired OTP' });
+      }
 
-    if (new Date() > new Date(otpRecord.expires_at)) {
-      await supabase.from('otp_cache').delete().eq('email', email);
-      return res.status(400).json({ error: 'Invalid or expired OTP' });
-    }
+      db.get(`SELECT * FROM users WHERE email = ?`, [email], (err, user) => {
+        if (err || !user) return res.status(400).json({ error: 'Invalid user' });
 
-    if (otpRecord.otp !== otp) {
-      return res.status(400).json({ error: 'Invalid or expired OTP' });
-    }
+        db.run(`UPDATE users SET email_verified_at = ? WHERE email = ?`, [new Date().toISOString(), email]);
+        db.run(`DELETE FROM otp_cache WHERE email = ?`, [email]);
 
-    const { data: user } = await supabase
-      .from('users')
-      .select('*')
-      .eq('email', email)
-      .maybeSingle();
-
-    if (!user) {
-      return res.status(400).json({ error: 'Invalid or expired OTP' });
-    }
-
-    await supabase
-      .from('users')
-      .update({ email_verified_at: new Date().toISOString() })
-      .eq('email', email);
-
-    await supabase.from('otp_cache').delete().eq('email', email);
-
-    const token = generateToken(user);
-
-    res.json({
-      message: 'OTP verified successfully',
-      token,
-      token_type: 'bearer',
-      user
+        const token = generateToken(user);
+        res.json({ message: 'OTP verified successfully', token, user });
+      });
     });
   } catch (error) {
     console.error('Verify OTP exception:', error);
@@ -175,43 +113,22 @@ export const verifyOtp = async (req, res) => {
   }
 };
 
+// --- RESEND OTP ---
 export const resendOtp = async (req, res) => {
   try {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      return res.status(422).json({ error: errors.array() });
-    }
-
     const { email } = req.body;
 
-    const { data: user } = await supabase
-      .from('users')
-      .select('*')
-      .eq('email', email)
-      .maybeSingle();
+    db.get(`SELECT * FROM users WHERE email = ?`, [email], (err, user) => {
+      if (err || !user) return res.status(404).json({ error: 'User not found' });
 
-    if (!user) {
-      return res.status(404).json({ error: 'User not found' });
-    }
+      const otp = generateOTP();
+      const expiry = new Date(Date.now() + OTP_EXPIRY_MINUTES * 60000).toISOString();
 
-    const otp = generateOTP();
-    const otpExpiry = new Date(Date.now() + OTP_EXPIRY_MINUTES * 60000);
-
-    await supabase
-      .from('otp_cache')
-      .delete()
-      .eq('email', email);
-
-    await supabase
-      .from('otp_cache')
-      .insert([{
-        email,
-        otp,
-        expires_at: otpExpiry.toISOString()
-      }]);
-
-    res.status(201).json({
-      message: 'OTP Resent Successfully.'
+      db.run(`DELETE FROM otp_cache WHERE email = ?`, [email]);
+      db.run(`INSERT INTO otp_cache (email, otp, expires_at) VALUES (?, ?, ?)`, [email, otp, expiry], (err) => {
+        if (err) return res.status(500).json({ error: 'Failed to resend OTP' });
+        res.status(201).json({ message: 'OTP Resent Successfully.' });
+      });
     });
   } catch (error) {
     console.error('Resend OTP exception:', error);
@@ -219,89 +136,60 @@ export const resendOtp = async (req, res) => {
   }
 };
 
+// --- FORGOT PASSWORD ---
 export const forgotPassword = async (req, res) => {
   try {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      return res.status(422).json({ error: errors.array() });
-    }
-
     const { email } = req.body;
 
-    const { data: user } = await supabase
-      .from('users')
-      .select('*')
-      .eq('email', email)
-      .maybeSingle();
+    db.get(`SELECT * FROM users WHERE email = ?`, [email], (err, user) => {
+      if (err || !user) return res.status(404).json({ error: 'User not found' });
 
-    if (!user) {
-      return res.status(404).json({ error: 'User not found' });
-    }
+      const resetToken = jwt.sign({ email }, JWT_SECRET, { expiresIn: '1h' });
 
-    const resetToken = jwt.sign({ email }, JWT_SECRET, { expiresIn: '1h' });
-
-    await supabase
-      .from('password_reset_tokens')
-      .delete()
-      .eq('email', email);
-
-    await supabase
-      .from('password_reset_tokens')
-      .insert([{
-        email,
-        token: resetToken,
-        created_at: new Date().toISOString()
-      }]);
-
-    res.json({ message: 'Reset link sent to your email.' });
+      db.run(`DELETE FROM password_reset_tokens WHERE email = ?`, [email]);
+      db.run(
+        `INSERT INTO password_reset_tokens (email, token, created_at) VALUES (?, ?, ?)`,
+        [email, resetToken, new Date().toISOString()],
+        (err) => {
+          if (err) return res.status(500).json({ error: 'Failed to store reset token' });
+          res.json({ message: 'Reset link sent to your email.' });
+        }
+      );
+    });
   } catch (error) {
     console.error('Forgot password exception:', error);
-    res.status(500).json({ error: 'An error occurred while sending reset link' });
+    res.status(500).json({ error: 'Error sending reset link' });
   }
 };
 
+// --- UPDATE PASSWORD ---
 export const updatePassword = async (req, res) => {
   try {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      return res.status(422).json({ error: errors.array() });
-    }
-
     const { email, password, token } = req.body;
 
-    const { data: resetRecord } = await supabase
-      .from('password_reset_tokens')
-      .select('*')
-      .eq('email', email.toLowerCase())
-      .maybeSingle();
+    db.get(`SELECT * FROM password_reset_tokens WHERE email = ?`, [email], async (err, record) => {
+      if (err || !record) return res.status(400).json({ error: 'Invalid or expired token' });
 
-    if (!resetRecord) {
-      return res.status(400).json({ error: 'Invalid or expired reset token' });
-    }
+      const age = Date.now() - new Date(record.created_at).getTime();
+      if (age > 60 * 60 * 1000) {
+        db.run(`DELETE FROM password_reset_tokens WHERE email = ?`, [email]);
+        return res.status(400).json({ error: 'Token expired' });
+      }
 
-    const tokenAge = Date.now() - new Date(resetRecord.created_at).getTime();
-    if (tokenAge > 60 * 60 * 1000) {
-      await supabase.from('password_reset_tokens').delete().eq('email', email);
-      return res.status(400).json({ error: 'Invalid or expired reset token' });
-    }
+      try {
+        jwt.verify(token, JWT_SECRET);
+      } catch {
+        return res.status(400).json({ error: 'Invalid token' });
+      }
 
-    try {
-      jwt.verify(token, JWT_SECRET);
-    } catch (err) {
-      return res.status(400).json({ error: 'Invalid or expired reset token' });
-    }
+      const hashedPassword = await bcrypt.hash(password, 10);
 
-    const hashedPassword = await bcrypt.hash(password, 10);
+      db.run(`UPDATE users SET password = ? WHERE email = ?`, [hashedPassword, email], (err) => {
+        if (err) return res.status(500).json({ error: 'Failed to update password' });
 
-    await supabase
-      .from('users')
-      .update({ password: hashedPassword })
-      .eq('email', email);
-
-    await supabase.from('password_reset_tokens').delete().eq('email', email);
-
-    res.status(201).json({
-      message: 'Password Updated Successfully.'
+        db.run(`DELETE FROM password_reset_tokens WHERE email = ?`, [email]);
+        res.status(201).json({ message: 'Password Updated Successfully.' });
+      });
     });
   } catch (error) {
     console.error('Update password exception:', error);
@@ -309,109 +197,59 @@ export const updatePassword = async (req, res) => {
   }
 };
 
-export const updateProfile = async (req, res) => {
+// --- UPDATE PROFILE ---
+export const updateProfile = (req, res) => {
   try {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      return res.status(422).json({ error: errors.array() });
-    }
+    const { id } = req.user;
+    const { name, phone } = req.body;
 
-    const user = req.user;
-    const { data: userData } = await supabase
-      .from('users')
-      .select('*')
-      .eq('id', user.id)
-      .maybeSingle();
+    if (!id) return res.status(401).json({ error: 'Unauthorized' });
 
-    if (!userData) {
-      return res.status(404).json({ error: 'User not found' });
-    }
+    db.run(
+      `UPDATE users SET 
+        name = COALESCE(?, name), 
+        phone = COALESCE(?, phone)
+      WHERE id = ?`,
+      [name, phone, id],
+      function (err) {
+        if (err) return res.status(500).json({ error: 'Database error' });
+        if (this.changes === 0) return res.status(404).json({ error: 'User not found' });
 
-    const nameParts = userData.name.split(' ');
-    const firstName = nameParts[0] || '';
-    const lastName = nameParts.slice(1).join(' ') || '';
-
-    const employeeData = {
-      email: userData.email,
-      phone: userData.phone,
-      first_name: req.body.first_name || firstName,
-      last_name: req.body.last_name || lastName,
-      photo: req.body.photo,
-      address: req.body.address,
-      emergency_contact_name: req.body.emergency_contact_name,
-      emergency_contact_phone: req.body.emergency_contact_phone,
-      designation: req.body.designation,
-      department: req.body.department,
-      manager_id: req.body.manager_id,
-      employment_type: req.body.employment_type,
-      date_of_joining: req.body.date_of_joining,
-      employee_code: req.body.employee_code,
-      gender: req.body.gender,
-      date_of_birth: req.body.date_of_birth,
-      role: req.body.role
-    };
-
-    const { data: existingEmployee } = await supabase
-      .from('employees')
-      .select('*')
-      .eq('email', userData.email)
-      .maybeSingle();
-
-    if (existingEmployee) {
-      const { data: updatedEmployee, error } = await supabase
-        .from('employees')
-        .update(employeeData)
-        .eq('email', userData.email)
-        .select()
-        .single();
-
-      if (error) {
-        return res.status(500).json({ error: 'Failed to update profile' });
+        res.json({ message: 'Profile updated successfully' });
       }
-
-      return res.json({
-        message: 'Employee profile updated successfully.',
-        employee: updatedEmployee
-      });
-    } else {
-      const { data: newEmployee, error } = await supabase
-        .from('employees')
-        .insert([employeeData])
-        .select()
-        .single();
-
-      if (error) {
-        return res.status(500).json({ error: 'Failed to create profile' });
-      }
-
-      return res.json({
-        message: 'Employee profile created successfully.',
-        employee: newEmployee
-      });
-    }
+    );
   } catch (error) {
     console.error('Update profile exception:', error);
     res.status(500).json({ error: 'An error occurred' });
   }
 };
 
-export const logout = async (req, res) => {
+// --- VERIFY EMAIL ---
+export const verifyEmail = async (req, res) => {
   try {
-    res.json({ message: 'Logged out successfully.' });
+    const { email, token } = req.body;
+
+    // In this simplified SQLite version, we’ll just confirm the email exists.
+    db.get(`SELECT * FROM users WHERE email = ?`, [email], (err, user) => {
+      if (err) return res.status(500).json({ error: 'Database error' });
+      if (!user) return res.status(404).json({ error: 'User not found' });
+
+      // Mark email as verified
+      db.run(`UPDATE users SET email_verified_at = ? WHERE email = ?`, [new Date().toISOString(), email], (err) => {
+        if (err) return res.status(500).json({ error: 'Failed to verify email' });
+        res.json({ message: 'Email verified successfully.' });
+      });
+    });
   } catch (error) {
+    console.error('Verify email exception:', error);
     res.status(500).json({ error: 'An error occurred' });
   }
 };
-
-export const verifyEmail = async (req, res) => {
+// --- LOGOUT ---
+export const logout = async (req, res) => {
   try {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      return res.status(422).json({ error: errors.array() });
-    }
-
-    res.json({ message: 'Email verified successfully.' });
-  } catch (error) {
+    res.json({ message: 'Logged out successfully.' });
+  } catch {
     res.status(500).json({ error: 'An error occurred' });
   }
 };

@@ -1,120 +1,111 @@
-import { supabase } from '../config/supabase.js';
+import { db } from '../config/database.js';
 
 export const createCrudController = (tableName) => {
   return {
+    // ✅ GET ALL RECORDS
     index: async (req, res) => {
-      try {
-        const { data, error } = await supabase.from(tableName).select('*');
-
-        if (error) {
-          return res.status(500).json({ error: error.message });
+      const query = `SELECT * FROM ${tableName}`;
+      db.all(query, [], (err, rows) => {
+        if (err) {
+          console.error(err);
+          return res.status(500).json({ error: 'Failed to fetch records' });
         }
-
-        res.status(200).json(data);
-      } catch (error) {
-        res.status(500).json({ error: 'Failed to fetch records' });
-      }
+        res.status(200).json(rows);
+      });
     },
 
+    // ✅ CREATE RECORD
     store: async (req, res) => {
-      try {
-        const { data, error } = await supabase
-          .from(tableName)
-          .insert([req.body])
-          .select()
-          .single();
+      const keys = Object.keys(req.body);
+      const values = Object.values(req.body);
+      const placeholders = keys.map(() => '?').join(',');
 
-        if (error) {
-          return res.status(400).json({ error: error.message });
+      const insertQuery = `INSERT INTO ${tableName} (${keys.join(',')}) VALUES (${placeholders})`;
+
+      db.run(insertQuery, values, function (err) {
+        if (err) {
+          console.error(err);
+          return res.status(500).json({ error: 'Failed to create record' });
         }
 
-        res.status(201).json(data);
-      } catch (error) {
-        res.status(500).json({ error: 'Failed to create record' });
-      }
+        const selectQuery = `SELECT * FROM ${tableName} WHERE id = ?`;
+        db.get(selectQuery, [this.lastID], (err, row) => {
+          if (err) {
+            return res.status(500).json({ error: 'Failed to fetch new record' });
+          }
+          res.status(201).json(row);
+        });
+      });
     },
 
+    // ✅ SHOW SINGLE RECORD
     show: async (req, res) => {
-      try {
-        const { id } = req.params;
-        const { data, error } = await supabase
-          .from(tableName)
-          .select('*')
-          .eq('id', id)
-          .maybeSingle();
+      const { id } = req.params;
+      const query = `SELECT * FROM ${tableName} WHERE id = ?`;
 
-        if (!data) {
+      db.get(query, [id], (err, row) => {
+        if (err) {
+          console.error(err);
+          return res.status(500).json({ error: 'Failed to fetch record' });
+        }
+        if (!row) {
           return res.status(404).json({ message: `${tableName} not found` });
         }
-
-        if (error) {
-          return res.status(500).json({ error: error.message });
-        }
-
-        res.json(data);
-      } catch (error) {
-        res.status(500).json({ error: 'Failed to fetch record' });
-      }
+        res.status(200).json(row);
+      });
     },
 
+    // ✅ UPDATE RECORD
     update: async (req, res) => {
-      try {
-        const { id } = req.params;
+      const { id } = req.params;
+      const keys = Object.keys(req.body);
+      const values = Object.values(req.body);
+      const updates = keys.map((key) => `${key} = ?`).join(', ');
 
-        const { data: existing } = await supabase
-          .from(tableName)
-          .select('*')
-          .eq('id', id)
-          .maybeSingle();
-
+      const checkQuery = `SELECT * FROM ${tableName} WHERE id = ?`;
+      db.get(checkQuery, [id], (err, existing) => {
+        if (err) {
+          return res.status(500).json({ error: 'Failed to check record' });
+        }
         if (!existing) {
           return res.status(404).json({ message: `${tableName} not found` });
         }
 
-        const { data, error } = await supabase
-          .from(tableName)
-          .update(req.body)
-          .eq('id', id)
-          .select()
-          .single();
+        const updateQuery = `UPDATE ${tableName} SET ${updates} WHERE id = ?`;
+        db.run(updateQuery, [...values, id], function (err) {
+          if (err) {
+            return res.status(500).json({ error: 'Failed to update record' });
+          }
 
-        if (error) {
-          return res.status(400).json({ error: error.message });
-        }
-
-        res.json(data);
-      } catch (error) {
-        res.status(500).json({ error: 'Failed to update record' });
-      }
+          db.get(`SELECT * FROM ${tableName} WHERE id = ?`, [id], (err, row) => {
+            if (err) {
+              return res.status(500).json({ error: 'Failed to fetch updated record' });
+            }
+            res.json(row);
+          });
+        });
+      });
     },
 
+    // ✅ DELETE RECORD
     destroy: async (req, res) => {
-      try {
-        const { id } = req.params;
+      const { id } = req.params;
 
-        const { data: existing } = await supabase
-          .from(tableName)
-          .select('*')
-          .eq('id', id)
-          .maybeSingle();
-
+      db.get(`SELECT * FROM ${tableName} WHERE id = ?`, [id], (err, existing) => {
+        if (err) {
+          return res.status(500).json({ error: 'Failed to check record' });
+        }
         if (!existing) {
           return res.status(404).json({ message: `${tableName} not found` });
         }
 
-        const { error } = await supabase
-          .from(tableName)
-          .delete()
-          .eq('id', id);
-
-        if (error) {
-          return res.status(400).json({ error: error.message });
-        }
-
-        res.json({ message: `${tableName} deleted successfully` });
-      } catch (error) {
-        res.status(500).json({ error: 'Failed to delete record' });
-      }
-    }
+        db.run(`DELETE FROM ${tableName} WHERE id = ?`, [id], function (err) {
+          if (err) {
+            return res.status(500).json({ error: 'Failed to delete record' });
+          }
+          res.json({ message: `${tableName} deleted successfully` });
+        });
+      });
+    },
   };
 };
