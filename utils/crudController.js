@@ -16,9 +16,13 @@ export const createCrudController = (tableName) => {
 
     // ✅ CREATE RECORD
     store: async (req, res) => {
+      if (Object.keys(req.body).length === 0) {
+        return res.status(400).json({ error: 'Request body cannot be empty' });
+      }
       const keys = Object.keys(req.body);
       const values = Object.values(req.body);
       const placeholders = keys.map(() => '?').join(',');
+      
 
       const insertQuery = `INSERT INTO ${tableName} (${keys.join(',')}) VALUES (${placeholders})`;
 
