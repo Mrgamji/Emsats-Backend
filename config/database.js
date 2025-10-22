@@ -34,9 +34,12 @@ db.serialize(() => {
   db.run(`
     CREATE TABLE IF NOT EXISTS otp_cache (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
-      email TEXT,
-      otp TEXT,
-      expires_at TEXT
+      email TEXT NOT NULL,
+      otp TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      fullname TEXT,
+      phone TEXT,
+      password TEXT
     );
   `);
 
