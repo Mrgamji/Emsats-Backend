@@ -24,7 +24,7 @@ router.post('/login',
 router.post('/signup',
   body('fullname').notEmpty().isString(),
   body('email').isEmail(),
-  body('password').isLength({ min: 6 }),
+  body('password').isLength({ min: 8 }),
   body('password_confirmation').custom((value, { req }) => value === req.body.password),
   signup
 );
